@@ -39,6 +39,23 @@ contract PredictionMarket is Ownable, ReentrancyGuard, IPredictionMarket {
     /// @notice Track if user has claimed payout
     mapping(uint256 => mapping(address => bool)) private _hasClaimed;
 
+    /// @notice Dispute window duration (48 hours)
+    uint256 public constant DISPUTE_WINDOW = 2 days;
+
+    /// @notice Oracle address (can resolve markets and disputes)
+    address public oracle;
+
+    /// @notice Dispute information per market
+    struct DisputeInfo {
+        bool disputed;
+        uint256 disputeEndTime;
+        address disputer;
+        uint256 resolutionTimestamp;
+    }
+
+    /// @notice Dispute tracking per market
+    mapping(uint256 => DisputeInfo) public disputes;
+
     /// @notice Prediction struct
     struct Prediction {
         address user;
@@ -68,6 +85,12 @@ contract PredictionMarket is Ownable, ReentrancyGuard, IPredictionMarket {
 
     /// @notice Event emitted when payout is claimed
     event PayoutClaimed(uint256 indexed marketId, address indexed user, uint256 amount);
+
+    /// @notice Event emitted when a resolution is disputed
+    event ResolutionDisputed(uint256 indexed marketId, address indexed disputer);
+
+    /// @notice Event emitted when a dispute is resolved
+    event DisputeResolved(uint256 indexed marketId, Outcome finalOutcome);
 
     /**
      * @notice Constructor
@@ -288,6 +311,7 @@ contract PredictionMarket is Ownable, ReentrancyGuard, IPredictionMarket {
         MarketInfo memory market = markets[marketId];
         require(market.id != 0, "PredictionMarket: market does not exist");
         require(market.resolved, "PredictionMarket: market not resolved");
+        require(!disputes[marketId].disputed, "PredictionMarket: market is disputed");
         require(!_hasClaimed[marketId][msg.sender], "PredictionMarket: already claimed");
 
         Prediction memory userPred = userPredictions[marketId][msg.sender];
@@ -340,12 +364,21 @@ contract PredictionMarket is Ownable, ReentrancyGuard, IPredictionMarket {
     }
 
     /**
+     * @notice Set oracle address (owner only)
+     * @param _oracle The oracle address
+     */
+    function setOracle(address _oracle) external onlyOwner {
+        require(_oracle != address(0), "PredictionMarket: invalid oracle address");
+        oracle = _oracle;
+    }
+
+    /**
      * @notice Resolve a market (called by Oracle)
      * @param marketId The market ID
      * @param outcome The winning outcome
      */
-    function resolve(uint256 marketId, Outcome outcome) external {
-        // TODO: Add access control for Oracle
+    function resolveMarket(uint256 marketId, Outcome outcome) external {
+        require(msg.sender == oracle || msg.sender == owner(), "PredictionMarket: only oracle or owner");
         MarketInfo storage market = markets[marketId];
         require(market.id != 0, "PredictionMarket: market does not exist");
         require(!market.resolved, "PredictionMarket: already resolved");
@@ -354,6 +387,121 @@ contract PredictionMarket is Ownable, ReentrancyGuard, IPredictionMarket {
         market.status = MarketStatus.Resolved;
         market.winningOutcome = outcome;
         market.resolved = true;
+
+        // Initialize dispute info with resolution timestamp and dispute window
+        disputes[marketId] = DisputeInfo({
+            disputed: false,
+            disputeEndTime: block.timestamp + DISPUTE_WINDOW,
+            disputer: address(0),
+            resolutionTimestamp: block.timestamp
+        });
+
+        emit MarketResolved(marketId, outcome);
+    }
+
+    /**
+     * @notice Dispute a market resolution
+     * @param marketId The market ID
+     */
+    function disputeResolution(uint256 marketId) external {
+        MarketInfo memory market = markets[marketId];
+        require(market.id != 0, "PredictionMarket: market does not exist");
+        require(market.resolved, "PredictionMarket: market not resolved");
+        
+        DisputeInfo memory dispute = disputes[marketId];
+        require(!dispute.disputed, "PredictionMarket: already disputed");
+        require(block.timestamp < dispute.disputeEndTime, "PredictionMarket: dispute window closed");
+
+        // Mark as disputed
+        disputes[marketId].disputed = true;
+        disputes[marketId].disputer = msg.sender;
+
+        // Change market status to allow dispute resolution
+        markets[marketId].status = MarketStatus.Active; // Temporarily set to Active during dispute
+
+        emit ResolutionDisputed(marketId, msg.sender);
+    }
+
+    /**
+     * @notice Resolve a dispute (called by Oracle/Owner after review)
+     * @param marketId The market ID
+     * @param finalOutcome The final outcome after dispute review
+     */
+    function resolveDispute(uint256 marketId, Outcome finalOutcome) external {
+        require(msg.sender == oracle || msg.sender == owner(), "PredictionMarket: only oracle or owner");
+        MarketInfo storage market = markets[marketId];
+        DisputeInfo memory dispute = disputes[marketId];
+        
+        require(market.id != 0, "PredictionMarket: market does not exist");
+        require(dispute.disputed, "PredictionMarket: not disputed");
+        require(market.status == MarketStatus.Active, "PredictionMarket: dispute already resolved");
+
+        // Update market with final outcome
+        market.status = MarketStatus.Resolved;
+        market.winningOutcome = finalOutcome;
+        market.resolved = true;
+
+        // Clear dispute (disputeEndTime can be used to check if dispute window has passed)
+        disputes[marketId].disputed = false;
+
+        emit DisputeResolved(marketId, finalOutcome);
+        emit MarketResolved(marketId, finalOutcome);
+    }
+
+    /**
+     * @notice Check if a market is in dispute window
+     * @param marketId The market ID
+     * @return True if still in dispute window
+     */
+    function inDisputeWindow(uint256 marketId) external view returns (bool) {
+        DisputeInfo memory dispute = disputes[marketId];
+        if (dispute.resolutionTimestamp == 0) {
+            return false; // Not resolved yet
+        }
+        return block.timestamp < dispute.disputeEndTime;
+    }
+
+    /**
+     * @notice Check if a market resolution is disputed
+     * @param marketId The market ID
+     * @return True if disputed
+     */
+    function isDisputed(uint256 marketId) external view returns (bool) {
+        return disputes[marketId].disputed;
+    }
+
+    /**
+     * @notice Get dispute information for a market
+     * @param marketId The market ID
+     * @return DisputeInfo struct
+     */
+    function getDisputeInfo(uint256 marketId) external view returns (DisputeInfo memory) {
+        return disputes[marketId];
+    }
+
+    /**
+     * @notice Legacy resolve function (for backward compatibility)
+     * @param marketId The market ID
+     * @param outcome The winning outcome
+     */
+    function resolve(uint256 marketId, Outcome outcome) external {
+        require(msg.sender == oracle || msg.sender == owner(), "PredictionMarket: only oracle or owner");
+        MarketInfo storage market = markets[marketId];
+        require(market.id != 0, "PredictionMarket: market does not exist");
+        require(!market.resolved, "PredictionMarket: already resolved");
+        require(block.timestamp >= market.endTime, "PredictionMarket: market not ended");
+
+        market.status = MarketStatus.Resolved;
+        market.winningOutcome = outcome;
+        market.resolved = true;
+
+        // Initialize dispute info with resolution timestamp and dispute window
+        disputes[marketId] = DisputeInfo({
+            disputed: false,
+            disputeEndTime: block.timestamp + DISPUTE_WINDOW,
+            disputer: address(0),
+            resolutionTimestamp: block.timestamp
+        });
 
         emit MarketResolved(marketId, outcome);
     }
